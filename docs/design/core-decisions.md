@@ -1,191 +1,204 @@
 # 核心设计决策
 
-状态：Draft
-日期：2026-06-25
+- 状态：Draft
+- 日期：2026-08-19
+
 相关文档：
 
-- [RFC-0001：HTBP Core](../rfcs/RFC-0001-htbp-core.md)
+- [RFC-0001：HTBP Core 0.1](../rfcs/RFC-0001-htbp-core.md)
 - [接入设计：Provider 与 Agent](provider-agent-integration.md)
 
-## 1. 协议边界
+## 1. 协议是一棵树，不是 REST API 旁挂说明
 
-HTBP 不是一套新的业务 API 规范。它只定义 Provider 如何在已有 HTTP API 旁边暴露 Agent 可读的控制面。
+HTBP 的协议对象是一个由 Tree Path 寻址的工具 namespace。上游能力可以来自 MCP、HTTP、Plugin、
+进程内 Provider、设备或远端 HTBP，但 Agent 看到的是同一棵树和同一套 Help/Invoke/Error 语义。
 
-HTBP 只标准化三类 endpoint：
-
-```txt
-GET  {path}/~help
-GET  {path}/~skill
-POST {path}/~register
-```
-
-其中 `~help` 是核心必选能力，`~skill` 是推荐能力，`~register` 是可选能力。
-
-HTBP 不定义：
+这取代了最初“保留 Provider 原生 Method/Path，只旁挂 `~help`”的设计。原因是仅有说明层无法统一：
 
 ```txt
-业务 Resource 的命名
-业务 Path 的层级
-业务 HTTP Method 的语义
-业务 response shape
-业务 error shape
-业务 pagination / idempotency / retry / streaming 规则
+身份可见性
+局部与全局发现
+调用 body
+错误恢复
+联邦路径
+多上游适配后的同一消费面
 ```
 
-这些内容全部由 Provider 原有 API 决定。HTBP 只描述它们。
+## 2. Core surface 保持小而闭合
 
-## 2. 为什么使用 `~` Control Segment
-
-HTBP 采用末尾 `~` segment 作为 control plane 标记：
+HTBP 0.1 Core 只要求形成完整的发现—调用回路：
 
 ```txt
-/api/repos/~help
-/api/repos/~skill
-/api/repos/{owner}/{repo}/~help
+GET  /<path>/~help
+GET  /<path>/~tree?depth=N
+POST /<node>/<tool>
+POST /<node>  {tool,arguments}
 ```
 
-这个设计有三个目的：
+`~describe/~search/~feedback/~register/~authorize/~mcp/~skill` 都不是 Core 必选面。Search、
+Feedback、Remote 等可以形成独立协议 profile；reverse registration、managed OAuth、MCP projection
+则是 tool-bridge 产品/adapter profile。扩展名被保留是为了避免路径冲突，不表示 Provider 已实现。
+
+## 3. 为什么保留 `~` Control Segment
+
+以 `~` 开头的 segment 专属于 control plane：
 
 ```txt
-1. 避免占用常见业务 Path，例如 /help、/skill。
-2. 允许在任意 Resource Path 下进行 local discovery。
-3. 让 Agent 通过简单后缀规则构造 control endpoint。
+/docs/context7/~help
+/docs/~tree
+/~search
 ```
 
-Provider 一旦在某个 Path namespace 采用 HTBP，就应该把精确末尾段 `~help`、`~skill`、`~register` 视为保留段。
+这使 control request 不会和普通节点或工具混淆，也允许 Agent 从任意 Tree Path 做局部发现。
+普通节点 segment 一律不得以 `~` 开头；未知 control segment 必须走 `404`，不能落到工具调用。
 
-## 3. 为什么不要求 `/.well-known/htbp`
+## 4. Help 是单一语义模型的多种表现
 
-`/.well-known/` 适合 origin-level metadata，但 HTBP 的核心是 resource-local metadata。
-
-Agent 可能被用户直接带到某个具体 Path：
+Help 同时提供：
 
 ```txt
-https://api.example.com/api/repos/octo/demo
+application/json   规范性机器可读形状
+text/plain         紧凑行式 DSL
+text/markdown      默认的人读与 Agent 阅读形态
 ```
 
-此时最有价值的问题不是“这个 origin 有哪些所有能力”，而是：
+三种表现必须从同一个模型渲染，避免独立维护后字段漂移。JSON/DSL 是结构化互操作面；Markdown
+排版可以改进，但客户端不应解析其版式。
+
+缺失或未知 `Accept` 默认 Markdown。显式 JSON 优先于 Markdown，Markdown 优先于 DSL。
+
+## 5. 两级披露，而不是一次发送全部 schema
+
+工具节点的 `~help` 是索引：保留 name、path、scope、简短 description 和副作用提示，可以省略
+input/output schema。需要调用某个工具时，再读取：
 
 ```txt
-这个 Resource Path 附近能做什么？
-我应该怎样调用这里的 API？
-有没有更深的 Skill 指南？
+GET /<node>/<tool>/~help
 ```
 
-所以 HTBP 的核心 discovery 是：
+这让拥有大量工具或大 schema 的节点仍可被低成本浏览。工具级 Help 是路径投影，不要求在 registry
+里持久化一个伪节点。
+
+## 6. 直接 URL 是首选，信封是通用兼容面
+
+普通工具在 Help 中宣告独立路径：
 
 ```txt
-GET /api/repos/octo/demo/~help
+POST /<node>/<tool>
+body = arguments object
 ```
 
-未来可以补充 origin-level discovery，但它不属于当前核心。
-
-## 4. Help 与 Skill 的职责分工
-
-Help 是 command index，目标是短、准、可直接进 context。
-
-Help 应回答：
+`cmd.path` 指向节点自身、或名字不适合单个 URL segment 的命令使用：
 
 ```txt
-有哪些 command？
-每个 command 用哪个 Method 和 Path？
-需要哪些 Query / Header / JSON Body？
-需要什么 auth / scope？
-成功 response 大概是什么？
-是否有 write/delete/external effect？
-是否需要 confirmation？
-更深的 Skill 在哪里？
+POST /<node>
+body = {tool, arguments}
 ```
 
-Skill 是 operational guidance，目标是教 Agent 做对复杂流程。
+工具节点仍可接受信封，便于旧客户端。tool-bridge 的 builtin/context/skillhub 通常采用该形状，
+但这是 reference taxonomy，不是 Core 路由规则；Agent 必须以 `cmd.path` 为准。
 
-Skill 应回答：
+## 7. 发现和调用共享同一授权下界
+
+Core 标准化 `read/call` 的可见性和调用语义；action token 可以扩展。tool-bridge IAM profile 另使用
+`write/register/admin`，并以 segment-aware glob 表达 path scope：deny 优先、无匹配默认拒绝、
+未知 action fail closed。其他实现可以使用不同 policy engine，但必须保持相同的对外可见性语义。
+
+授权分两层：
 
 ```txt
-什么时候使用这些 endpoint？
-多步 workflow 的顺序是什么？
-哪些操作危险？
-哪些错误常见？
-如何处理 pagination / long-running operation？
-什么时候需要用户确认？
+read 不允许  → 404，不泄露节点存在性
+read 允许但命令 action 不允许 → 403
 ```
 
-一个简单只读调用应该只靠 Help 完成。只有当 task 需要 judgment 或 workflow 时，Agent 才应该读取 Skill。
+根 Help/Tree 作为已认证入口，但返回内容必须裁剪。Tree、Help、Search、Feedback、MCP 投影和远端
+聚合都复用该规则；派生索引和缓存不能变成授权真源。
 
-## 5. Auth 与 OAuth 设计
+## 8. 错误形状属于协议核心
 
-HTBP 不发明新的 auth protocol。
+不同上游错误必须归一为：
 
-基础调用使用标准 header：
-
-```http
-Authorization: Bearer <token>
+```json
+{"code":"invalid_argument","message":"...","retryable":false}
 ```
 
-Agent 身份可以用可选 header 表达：
-
-```http
-X-Agent-Id: <agent-id>
-```
-
-`X-Agent-Id` 不是 credential，只用于 audit、attribution 或 policy hint。
-
-如果 Provider 使用 OAuth，HTBP 复用既有 OAuth metadata：
+稳定 code 是：
 
 ```txt
-Help:
-  auth oauth2
-  oauth_resource <protected-resource-metadata-url>
-
-401:
-  WWW-Authenticate: Bearer resource_metadata="<protected-resource-metadata-url>"
+not_found  permission_denied  invalid_argument  conflict
+unavailable  rate_limited  internal
 ```
 
-`~register` 是可选 onboarding endpoint。它可以封装或指向 OAuth Dynamic Client Registration，也可以指向 Provider 自定义接入流程。
+客户端按 code + HTTP status 做控制流，不匹配 message。只有 rate-limited、unavailable、internal
+可以重试；401 仍使用 permission_denied，501 仍使用 unavailable。
 
-## 6. Agent 消费流程
+## 9. 节点 kind 是提示，Help 才是可调用真相
 
-最小 Agent flow：
+tool-bridge reference profile 当前有：
 
 ```txt
-1. 拿到 Domain 或 Resource Path。
-2. 请求 {path}/~help。
-3. 选择满足用户意图的最小 command。
-4. 按 Help 构造 Provider 原生 HTTP request。
-5. 必要时读取 {path}/~skill。
-6. 执行业务 API。
-7. 按 Provider 原有 response / error format 解释结果。
+directory mcp http builtin context device remote tool skillhub
 ```
 
-Agent 不应该一次性抓完整 Domain 的所有 Skill。HTBP 默认是 progressive disclosure。
+这不是 Core 的封闭枚举。客户端必须容忍未知 kind，并读取 `~help`。Provider 只展示实际可调用的
+command；只读挂载必须隐藏写动词，Plugin 或设备没有实现的方法不能因为 profile 默认值而出现在 Help。
 
-## 7. 当前已定决策
+## 10. `~tree` 必须有界且诚实
 
-| 主题 | 决策 |
-| --- | --- |
-| 控制面寻址 | 使用末尾 `~help`、`~skill`、`~register` |
-| Resource 形态 | 不限制，由 Provider 自己定义 |
-| 业务 Method | 不限制，沿用 Provider 原有 API |
-| Help 格式 | `text/plain` 紧凑 DSL |
-| Skill 格式 | Markdown，推荐 `text/markdown` |
-| Auth | 标准 `Authorization: Bearer` |
-| Agent 标识 | 可选 `X-Agent-Id` |
-| OAuth | 复用 OAuth metadata，不自创 |
-| Register | 可选 endpoint，只定义宽泛用途 |
-| Discovery 方式 | resource-local，progressive disclosure |
-| `OPTIONS` / `HEAD` | 不作为 discovery 依赖 |
-| `.well-known` | 当前不要求，留给后续 RFC |
+Tree 默认深度 2、最大深度 8、默认最多展开 500 节点。达到深度、节点、环或不透明远端边界时，
+使用 `truncated:true`，不能把未展开节点伪装成叶子。
 
-## 8. 当前待讨论问题
+非根 Tree 必须对应真实节点，并使用它的真实 kind/description；不能凭 URL 伪造 directory。
 
-以下问题不阻塞核心协议，但需要后续拍板：
+## 11. 可选扩展遵循显式 capability
+
+`~describe` 只返回可选能力。没有能力就 `404`。全局 Search 只有根声明 `search` 后才存在；
+`search:semantic` 另行声明。Context/SkillHub 的可选动词也必须和实际 handler 一致。
+
+扩展的共同规则：
 
 ```txt
-Help DSL 是否需要 formal grammar？
-是否提供 JSON Help 作为并列表达？
-是否注册 HTBP 专用 media type？
-是否定义 origin-level discovery？
-是否为 streaming / long-running operation 定义标准 hint？
-是否需要 conformance test suite？
+未声明 = 不可假设
+派生状态 = 非授权真源
+未知可选字段 = 消费端忽略
+未知写入字段 = 服务端拒绝
 ```
 
+## 12. tool-bridge 的 `~register` 是产品管理面
+
+最初草案把 `~register` 宽泛描述为账号、token 或 OAuth client onboarding。tool-bridge product profile
+把同名路径用于反向 NodeInput 注册：URL path 必须等于 body.path，并执行自己的 register scope、
+registerPaths、保留根、credential binding 和配置校验。
+
+NodeInput/IAM/SecretStore 没有进入 Core，其他 Provider 不承担兼容义务。OAuth client registration
+应继续使用标准 OAuth metadata；这次同名语义碰撞必须在兼容章节明确标成破坏性变更。
+
+## 13. `~skill` 暂不进入 Core
+
+Skill 仍是有价值的渐进指导层，但当前本地实现没有稳定的 Skill wire contract。因此 `~skill` 只保留
+路径；本地可以返回 501，remote 可以透传。等信任边界、格式、缓存和发现条件稳定后再单独标准化。
+
+## 14. 联邦保持同形，但身份不透传
+
+Remote mount 把本地挂载前缀剥掉后，同形转发 `~help`、`~tree`、`~skill` 和 POST。远端目标必须
+在 allowlist 中；空 allowlist fail closed。
+
+本地调用者的 Secret Key 不得传给远端。Remote mount 使用受保护的独立 credential 建立远端身份，
+并通过 Via/hop limit、canonical path 和挂载边界检查阻止环与路径逃逸。该 credential 可以比本地
+caller 权限更高，这是必须最小化并审计的服务账号 delegation，不是端到端 caller identity。
+
+## 15. 当前不再开放的问题
+
+以下问题已由 0.1 wire 定型，不再作为待讨论项：
+
+```txt
+是否有 JSON Help：有，且是规范性表现。
+是否定义树发现：有，~tree 是 Core。
+是否统一调用：有，直接 POST + 信封 POST。
+是否统一错误：有，七码 ErrorBody。
+~register 是什么：Core 只保留命名；tool-bridge product profile 用于反向节点注册。
+~skill 是否必选：不是，仍是保留扩展。
+```
+
+仍可后续标准化的内容包括专用 media type、Skill RFC、origin-level discovery、正式 DSL grammar、
+streaming/long-running hint 和跨实现 conformance suite。
